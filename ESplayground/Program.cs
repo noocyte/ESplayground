@@ -387,13 +387,13 @@ namespace ESplayground
             var read = "read";
 
             EntityRead = $"{IndexDescriptor.EntityTypeName}_{read}_{prefix}";
-            EntityRead = $"{IndexDescriptor.EntityTypeName}_{write}_{prefix}";
+            EntityWrite = $"{IndexDescriptor.EntityTypeName}_{write}_{prefix}";
 
             ArticleRead = $"{IndexDescriptor.ArticleTypeName}_{read}_{prefix}";
-            ArticleRead = $"{IndexDescriptor.ArticleTypeName}_{write}_{prefix}";
+            ArticleWrite = $"{IndexDescriptor.ArticleTypeName}_{write}_{prefix}";
 
             ObjectviewRead = $"{IndexDescriptor.ObjectViewTypeName}_{read}_{prefix}";
-            ObjectviewRead = $"{IndexDescriptor.ObjectViewTypeName}_{write}_{prefix}";
+            ObjectviewWrite = $"{IndexDescriptor.ObjectViewTypeName}_{write}_{prefix}";
         }
 
         public string EntityRead { get; }
