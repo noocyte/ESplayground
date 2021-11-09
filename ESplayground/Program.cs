@@ -41,7 +41,8 @@ namespace ESplayground
                     for (int i = 0; i < numberOfOrgs; i++)
                     {
                         var localPrefix = prefixGenerator.Generate();
-                        SetAliasForIndex(localPrefix, d);
+                        var localAlias = new AliasNames(localPrefix);
+                        SetAliasForIndex(localPrefix, d, localAlias);
                     }
 
 
@@ -52,20 +53,22 @@ namespace ESplayground
             var descriptors = GetIndexDescriptors().ToList();
             if (descriptors.Any(d => d.Prefix == prefix)) return; // this means we already have provisioned something...
 
+            var prefixAlias = new AliasNames(prefix);
+
             var articleDescriptor = IndexDescriptor.Articles(prefix, 0);
             _client.Indices.Create(articleDescriptor);
-            SetAliasForIndex(prefix, articleDescriptor);
+            SetAliasForIndex(prefix, articleDescriptor, prefixAlias);
 
             var objectviewDescriptor = IndexDescriptor.Objectviews(prefix, 0);
             _client.Indices.Create(objectviewDescriptor);
-            SetAliasForIndex(prefix, objectviewDescriptor);
+            SetAliasForIndex(prefix, objectviewDescriptor, prefixAlias);
 
 
             var nextTrack = NextEntityTrack();
             var maxGeneration = MaxEntityGeneration(nextTrack);
             var entitiesDescriptor = IndexDescriptor.Entities(nextTrack, maxGeneration);
             _client.Indices.Create(entitiesDescriptor);
-            SetAliasForIndex(prefix, entitiesDescriptor);
+            SetAliasForIndex(prefix, entitiesDescriptor, prefixAlias);
 
             var alias = _client.Indices.GetAlias();
             descriptors = GetIndexDescriptors().ToList();
@@ -81,65 +84,66 @@ namespace ESplayground
 
 
             alias = _client.Indices.GetAlias();
+            var aliasNames = new AliasNames(prefix);
             // create first index for current prefix
             var currentGeneration = GetCurrentGenerationOrDefault(prefix, IndexDescriptor.ObjectViewTypeName);
             CreateObjectViewIndex(prefix, currentGeneration);
-            SetAliasForObjectview(prefix, currentGeneration);
+            SetAliasForObjectview(prefix, currentGeneration, prefixAlias);
 
             // add some data to index
 
             var data = PlaygroundDataGenerator.Data(prefix).ToList();
 
-            var indexResponse = BulkIndex(prefix, data);
-            var searchResponse = FindAll(prefix);
+            var indexResponse = BulkIndexObjectview(prefix, data, aliasNames);
+            var searchResponse = FindAll(prefixAlias);
             Console.WriteLine(searchResponse.Documents.Count);
 
             // pretend we want to reindex... 
             var nextGeneration = GetNextGeneration(prefix, IndexDescriptor.ObjectViewTypeName);
             CreateObjectViewIndex(prefix, nextGeneration);
-            SetWriteToNextReadFromBoth(prefix, currentGeneration, nextGeneration);
+            SetWriteToNextReadFromBoth(prefix, currentGeneration, nextGeneration, prefixAlias);
 
             // write half data to new index
             alias = _client.Indices.GetAlias();
 
             //     var indexDescs = alias.Indices.Select(i =>  IndexDescriptor(i.Key.Name));
 
-            indexResponse = BulkIndex(prefix, data.Take(5));
-            searchResponse = FindAll(prefix);
+            indexResponse = BulkIndexObjectview(prefix, data.Take(5), aliasNames);
+            searchResponse = FindAll(prefixAlias);
             Console.WriteLine(searchResponse.Documents.Count);
             // should still be 10 documents
             // TODO: Change version for one, add one new - check if we get 11
             data.Last().Version = 1;
             data.Add(new Playground { Id = "10", Title = "New thing", Prefix = prefix });
 
-            indexResponse = BulkIndex(prefix, data.Skip(5));
+            indexResponse = BulkIndexObjectview(prefix, data.Skip(5), aliasNames);
 
             // here reindex is complete, so we can set alias to just point to next and remove prev
-            ResetAliasForObjectview(prefix, currentGeneration, nextGeneration);
+            ResetAliasForObjectview(prefix, currentGeneration, nextGeneration, prefixAlias);
             var indexTobeRemoved = IndexDescriptor.Objectviews(prefix, currentGeneration);
 
-            searchResponse = FindAll(prefix);
+            searchResponse = FindAll(prefixAlias);
 
             _client.Indices.Delete(indexTobeRemoved);
 
-            searchResponse = FindAll(prefix);
+            searchResponse = FindAll(prefixAlias);
 
             alias = _client.Indices.GetAlias();
         }
 
-        private BulkResponse BulkIndex(string prefix, IEnumerable<Playground> foo)
+        private BulkResponse BulkIndexObjectview(string prefix, IEnumerable<Playground> foo, AliasNames alias)
         {
             return _client.Bulk(b => b
-                    .Index(WriteAlias(prefix))
+                    .Index(alias.ObjectviewWrite)
                     .IndexMany(foo, (descriptor, play) => descriptor
                         .VersionType(Elasticsearch.Net.VersionType.External)
                         .Version(play.Version)));
         }
 
-        private ISearchResponse<Playground> FindAll(string prefix)
+        private ISearchResponse<Playground> FindAll(AliasNames alias)
         {
             Thread.Sleep(200);
-            return _client.Search<Playground>(d => d.MatchAll().Size(20).Index(ReadAlias(prefix)));
+            return _client.Search<Playground>(d => d.MatchAll().Size(20).Index(alias.ObjectviewRead));
         }
 
         private long GetNextGeneration(string prefix, string indexTypeName)
@@ -158,11 +162,19 @@ namespace ESplayground
             var descriptors = GetIndexDescriptors();
             var maxCurrentGeneration = descriptors
                 .Where(d => d.Prefix == prefix)
-                .DefaultIfEmpty(new IndexDescriptor($"{indexTypeName}_{prefix}_0"))
+                .DefaultIfEmpty(ToIndexDescriptor(indexTypeName, prefix))
                 .Max(d => d.Generation);
 
             return maxCurrentGeneration;
         }
+
+        public static IndexDescriptor ToIndexDescriptor(string indexTypeName, string prefix, long generation = 0, long track = 0) => indexTypeName switch
+        {
+            IndexDescriptor.ArticleTypeName => IndexDescriptor.Articles(prefix, generation),
+            IndexDescriptor.ObjectViewTypeName => IndexDescriptor.Objectviews(prefix, generation),
+            IndexDescriptor.EntityTypeName => IndexDescriptor.Entities(track, generation),
+            _ => throw new ArgumentOutOfRangeException(nameof(indexTypeName), $"Not expected indexTypeName value: {indexTypeName}"),
+        };
 
         private IEnumerable<IndexDescriptor> GetIndexDescriptors()
         {
@@ -205,71 +217,68 @@ namespace ESplayground
             }
         }
 
-        private BulkAliasResponse SetAliasForIndex(string prefix, IndexDescriptor index)
+        private BulkAliasResponse SetAliasForIndex(string prefix, IndexDescriptor index, AliasNames alias)
         {
             return _client.Indices.BulkAlias(d => d
             .Add(a => a
-                .Alias(WriteAlias(prefix))
+                .Alias(alias.ObjectviewWrite)
                 .Index(index)
                 .Filter<Playground>(f => f.Term(p => p.Prefix, prefix)))
             .Add(a =>
-                a.Alias(ReadAlias(prefix))
+                a.Alias(alias.ObjectviewRead)
                 .Indices(index)
                 .Filter<Playground>(f => f.Term(p => p.Prefix, prefix)))
-                        );
+            );
         }
 
-        private BulkAliasResponse SetAliasForObjectview(string prefix, long gen1)
+        private BulkAliasResponse SetAliasForObjectview(string prefix, long gen1, AliasNames alias)
         {
             return _client.Indices.BulkAlias(d => d
             .Add(a => a
-                       .Alias(WriteAlias(prefix))
+                       .Alias(alias.ObjectviewWrite)
                        .Index(IndexDescriptor.Objectviews(prefix, gen1))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                        ).Add(a =>
-                        a.Alias(ReadAlias(prefix))
+                        a.Alias(alias.ObjectviewRead)
                         .Indices(IndexDescriptor.Objectviews(prefix, gen1))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                         )
                         );
         }
 
-        private static string ReadAlias(string prefix) => $"objectview_read_{prefix}";
-        private static string WriteAlias(string prefix) => $"objectview_write_{prefix}";
-
-        private BulkAliasResponse SetWriteToNextReadFromBoth(string prefix, long curr, long next)
+        private BulkAliasResponse SetWriteToNextReadFromBoth(string prefix, long curr, long next, AliasNames alias)
         {
             return _client.Indices.BulkAlias(d => d
-            .Remove(r => r.Alias(WriteAlias(prefix))
+            .Remove(r => r.Alias(alias.ObjectviewWrite)
             .Indices(IndexDescriptor.Objectviews(prefix, curr))
             )
             .Add(a => a
-                       .Alias(WriteAlias(prefix))
+                       .Alias(alias.ObjectviewWrite)
                        .Index(IndexDescriptor.Objectviews(prefix, next))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                        ).Add(a =>
-                        a.Alias(ReadAlias(prefix))
+                        a.Alias(alias.ObjectviewRead)
                         .Indices(new string[] { IndexDescriptor.Objectviews(prefix, curr), IndexDescriptor.Objectviews(prefix, next) })
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                         )
                         );
         }
 
-        private BulkAliasResponse ResetAliasForObjectview(string prefix, long prev, long curr)
+        private BulkAliasResponse ResetAliasForObjectview(string prefix, long prev, long curr, AliasNames alias)
         {
             return _client.Indices.BulkAlias(d => d
-            .Remove(r => r.Alias(WriteAlias(prefix))
+            .Remove(r => r.Alias(alias.ObjectviewWrite)
             .Indices(IndexDescriptor.Objectviews(prefix, prev))
             )
-            .Remove(r => r.Alias(ReadAlias(prefix))
+            .Remove(r => r.Alias(alias.ObjectviewRead)
             .Indices(IndexDescriptor.Objectviews(prefix, prev))
             )
             .Add(a => a
-                       .Alias(WriteAlias(prefix))
+                       .Alias(alias.ObjectviewWrite)
                        .Index(IndexDescriptor.Objectviews(prefix, curr))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                        ).Add(a =>
-                        a.Alias(ReadAlias(prefix))
+                        a.Alias(alias.ObjectviewRead)
                         .Indices(IndexDescriptor.Objectviews(prefix, curr))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                         )
@@ -277,21 +286,21 @@ namespace ESplayground
         }
 
 
-        private BulkAliasResponse SetAliasForObjectview(string prefix, long gen0, long gen1, long gen2)
+        private BulkAliasResponse SetAliasForObjectview(string prefix, long gen0, long gen1, long gen2, AliasNames alias)
         {
             return _client.Indices.BulkAlias(d => d
-            .Remove(r => r.Alias(WriteAlias(prefix))
+            .Remove(r => r.Alias(alias.ObjectviewWrite)
             .Indices(new string[] { IndexDescriptor.Objectviews(prefix, gen0), IndexDescriptor.Objectviews(prefix, gen1) })
             )
-            .Remove(r => r.Alias(ReadAlias(prefix))
+            .Remove(r => r.Alias(alias.ObjectviewRead)
             .Indices(IndexDescriptor.Objectviews(prefix, gen0).ToString())
             )
             .Add(a => a
-                       .Alias(WriteAlias(prefix))
+                       .Alias(alias.ObjectviewWrite)
                        .Index(IndexDescriptor.Objectviews(prefix, gen2))
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                        ).Add(a =>
-                        a.Alias(ReadAlias(prefix))
+                        a.Alias(alias.ObjectviewRead)
                         .Indices(new string[] { IndexDescriptor.Objectviews(prefix, gen1), IndexDescriptor.Objectviews(prefix, gen2) })
                        .Filter<Playground>(f => f.Term(p => p.Prefix, prefix))
                         )
@@ -307,9 +316,9 @@ namespace ESplayground
 
     public class IndexDescriptor
     {
-        internal static readonly string ObjectViewTypeName = "objectview"; // objectview_prefix_generation
-        internal static readonly string ArticleTypeName = "article";       // article_prefix_generation
-        internal static readonly string EntityTypeName = "entity";         // entity_track_generation
+        internal const string ObjectViewTypeName = "objectview"; // objectview_prefix_generation
+        internal const string ArticleTypeName = "article";       // article_prefix_generation
+        internal const string EntityTypeName = "entity";         // entity_track_generation
 
         public bool IsEntityIndex => IndexTypeName.Equals(EntityTypeName);
 
@@ -368,8 +377,35 @@ namespace ESplayground
               ? $"{IndexTypeName}_{Track}_{Generation}"
               : $"{IndexTypeName}_{Prefix}_{Generation}";
         }
-
     }
+
+    public record AliasNames
+    {
+        public AliasNames(string prefix)
+        {
+            var write = "write";
+            var read = "read";
+
+            EntityRead = $"{IndexDescriptor.EntityTypeName}_{read}_{prefix}";
+            EntityRead = $"{IndexDescriptor.EntityTypeName}_{write}_{prefix}";
+
+            ArticleRead = $"{IndexDescriptor.ArticleTypeName}_{read}_{prefix}";
+            ArticleRead = $"{IndexDescriptor.ArticleTypeName}_{write}_{prefix}";
+
+            ObjectviewRead = $"{IndexDescriptor.ObjectViewTypeName}_{read}_{prefix}";
+            ObjectviewRead = $"{IndexDescriptor.ObjectViewTypeName}_{write}_{prefix}";
+        }
+
+        public string EntityRead { get; }
+        public string EntityWrite { get; }
+
+        public string ObjectviewRead { get; }
+        public string ObjectviewWrite { get; }
+
+        public string ArticleRead { get; }
+        public string ArticleWrite { get; }
+    }
+
 
     public class Playground
     {
